@@ -16,6 +16,7 @@ import collections
 import ipaddress
 import pyroute2
 import threading
+import asyncore
 
 from oslo_concurrency import lockutils
 from oslo_config import cfg
@@ -27,6 +28,7 @@ from ovn_bgp_agent.drivers.openstack.utils import driver_utils
 from ovn_bgp_agent.drivers.openstack.utils import frr
 from ovn_bgp_agent.drivers.openstack.utils import ovn
 from ovn_bgp_agent.drivers.openstack.utils import ovs
+from ovn_bgp_agent.drivers.openstack.utils import enable_fdp
 from ovn_bgp_agent.drivers.openstack.watchers import bgp_watcher as watcher
 from ovn_bgp_agent import exceptions as agent_exc
 from ovn_bgp_agent.utils import linux_net
@@ -124,6 +126,12 @@ class OVNBGPDriver(driver_api.AgentDriverBase):
 
         # Now IDL connections can be safely used
         self._post_fork_event.set()
+
+        # Enable Fast Data Path:
+        # Wait on FPM socket to get route updates from Zebra
+        # and add them to OVN NB DB
+        self.fdp = enable_fdp.FpmServerConnect(FPM_PORT=2620)
+        self.fdp.run()
 
     def _get_events(self):
         events = set(["PortBindingChassisCreatedEvent",
