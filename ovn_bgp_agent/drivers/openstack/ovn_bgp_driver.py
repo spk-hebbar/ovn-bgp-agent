@@ -57,6 +57,7 @@ class OVNBGPDriver(driver_api.AgentDriverBase):
         self.ovn_lb_vips = collections.defaultdict()
 
         self._sb_idl = None
+        self.fdp = None
         self._post_fork_event = threading.Event()
 
     @property
@@ -131,7 +132,6 @@ class OVNBGPDriver(driver_api.AgentDriverBase):
         # Wait on FPM socket to get route updates from Zebra
         # and add them to OVN NB DB
         self.fdp = enable_fdp.FpmServerConnect(FPM_PORT=2620)
-        self.fdp.run()
 
     def _get_events(self):
         events = set(["PortBindingChassisCreatedEvent",
@@ -164,6 +164,10 @@ class OVNBGPDriver(driver_api.AgentDriverBase):
         # Create OVN dummy device
         linux_net.ensure_ovn_device(CONF.bgp_nic,
                                     CONF.bgp_vrf)
+
+        #Run asyncore loop to get routes from Zebra and add them to OVN NB DB
+        # TODO(spk): Keep a config to separate between fdp and kernel routing
+        self.fdp.run()
 
         LOG.debug("Configuring br-ex default rule and routing tables for "
                   "each provider network")

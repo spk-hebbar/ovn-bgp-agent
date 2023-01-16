@@ -3,31 +3,22 @@ import socket
 import struct
 import sys
 import asyncore
+import pyroute2
+import netifaces
 
 from enum import IntEnum
 from oslo_log import log as logging
+from pyroute2 import IPRoute
 
-from ovn_bgp_agent.drivers.openstack.utils.fpm import fpm_pb2
-from ovn_bgp_agent.drivers.openstack.utils.qpb import qpb_pb2
+from pyroute2.netlink.rtnl.rtmsg import rtmsg
+from pyroute2.netlink.rtnl import (RTM_NEWROUTE as RTNL_NEWROUTE,
+                                   RTM_DELROUTE as RTNL_DELROUTE)
+from pyroute2.netlink.rtnl import rt_proto as proto
 
 LOG = logging.getLogger(__name__)
-# To enable FPM module with protobuf, the following option in
+# To enable FPM module with netlink, the following option in
 # /etc/frr/daemons needs to be added for zebra
-# zebra_options="  -A 127.0.0.1 -s 90000000  -M fpm:protobuf"
-FPM_PORT=2620
-
-class Protocol(IntEnum):
-    UNKNOWN_PROTO = 0
-    LOCAL = 1
-    CONNECTED = 2
-    KERNEL = 3
-    STATIC = 4
-    RIP = 5
-    RIPNG = 6
-    OSPF = 7
-    ISIS = 8
-    BGP = 9
-    OTHER = 10
+# zebra_options="  -A 127.0.0.1 -s 90000000  -M fpm:netlink"
 
 class FpmServerConnect(asyncore.dispatcher):
     def __init__(self, FPM_PORT):
@@ -40,54 +31,60 @@ class FpmServerConnect(asyncore.dispatcher):
     def run(self):
         try:
             asyncore.loop()
-        except asyncore.ExitNow:
-            LOG.error("asynccore loop exiting")
+        except:
+            self.handle_error()
 
     def handle_accept(self):
-        pair = self.accept( )
+        pair = self.accept()
         if pair is not None:
             conn, client_addr = pair
             UpdateRoutes(conn)
 
 class UpdateRoutes(asyncore.dispatcher):
-    def update_FRR_route_to_NBDB(self, route):
-        zebra_msg = fpm_pb2.Message()
-        zebra_msg.ParseFromString(route)
-        if zebra_msg.add_route:
-            r = zebra_msg.add_route
-            if r.address_family == qpb_pb2.AddressFamily.IPV4:
-                while len(r.key.prefix.bytes) < 4:
-                    r.key.prefix.bytes += b'\0'
-                dst = socket.inet_ntoa(r.key.prefix.bytes)
-                next_hop = ""
-                if r.nexthops[0].if_id:
-                    next_hop = str(r.nexthops[0].if_id)
-                if r.nexthops[0].address:
-                    next_hop = socket.inet_ntoa(struct.pack("!I", r.nexthops[0].address.v4.value))
-                if r.protocol == Protocol.BGP:
-                    LOG.info("ADD IPV4 %s/%d via %s proto BGP to OVN NB DB" % (dst, r.key.prefix.length, next_hop))
-                    os.system("ovn-nbctl lr-route-add rtr %s/%d %s " % (dst, r.key.prefix.length, next_hop))
+    def update_FRR_route_to_NBDB(self, payload):
+        offset = 0
+        while offset < len(payload):
+            msg = rtmsg(payload[offset:])
+            msg.decode()
+            offset += msg['header']['length']
+            next_hop = ""
+            prefix_len = msg['dst_len']
+            for a in msg['attrs']:
+                if a[0] == 'RTA_DST':
+                    dst = (a[1])
+            if msg['proto'] == proto['zebra']:
+                if msg['header']['type'] == RTNL_NEWROUTE:
+                    for a in msg['attrs']:
+                        if a[0] == 'RTA_GATEWAY':
+                            next_hop = (a[1])
+                        elif a[0] == 'RTA_OIF':
+                            inf_id = a[1]
+                            ip = IPRoute()
+                            if msg['family'] == socket.AF_INET:
+                                next_hop = ip.get_addr(family=socket.AF_INET, index=inf_id)[0].get_attr('IFA_ADDRESS')
+                            elif msg['family'] == socket.AF_INET6:
+                                next_hop = ip.get_addr(family=socket.AF_INET6, index=inf_id)[0].get_attr('IFA_ADDRESS')
 
-        if zebra_msg.delete_route:
-            r = zebra_msg.delete_route
-            if r.address_family == qpb_pb2.AddressFamily.IPV4:
-                while len(r.key.prefix.bytes) < 4:
-                    r.key.prefix.bytes += b'\0'
-                dst = socket.inet_ntoa(r.key.prefix.bytes)
-                LOG.INFO("DELETE IPV4 %s/%d " % (dst, r.key.prefix.length))
-                os.system("ovn-nbctl lr-route-del rtr %s/%d" % (dst, r.key.prefix.length))
+                    # TODO(spk): What if there is a route to be added/deleted
+                    # with dst and prefix_len same as a route which is
+                    # already added/deleted but next hop is different, use --ecmp
+                    LOG.info(f"Adding route: dst={dst}/{prefix_len}, next_hop={next_hop}")
+                    os.system("ovn-nbctl lr-route-add lr0 %s/%d %s " % (dst, prefix_len, next_hop))
+            if msg['header']['type'] == RTNL_DELROUTE:
+                LOG.info(f"Deleting route: dst={dst}/{prefix_len}")
+                os.system("ovn-nbctl lr-route-del lr0 %s/%d " %(dst, prefix_len))
         return
 
     def handle_read(self):
         data = self.recv(4)
         version,msg_type,length = struct.unpack('!BBH', data)
         payload = self.recv(length-4)
-        if msg_type == 1:
-            LOG.error("Unexpected Netlink message")
-            self.close()
+        if msg_type == 2:
+            LOG.error("Unexpected Protobuf message")
+            self.handle_error()
             return
         self.update_FRR_route_to_NBDB(payload)
 
     def handle_error(self):
         self.close()
-        raise asyncore.ExitNow('Quitting!')
+        raise asyncore.ExitNow("Shutting down FPM server")
