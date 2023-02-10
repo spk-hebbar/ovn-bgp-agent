@@ -12,15 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 from oslo_config import cfg
 from oslo_log import log as logging
 
 from ovs.stream import Stream
 from ovsdbapp.backend import ovs_idl
 from ovsdbapp.backend.ovs_idl import connection
+from ovsdbapp.backend.ovs_idl import command
 from ovsdbapp.backend.ovs_idl import idlutils
 from ovsdbapp import event
 from ovsdbapp.schema.ovn_southbound import impl_idl as sb_impl_idl
+from ovsdbapp.schema.ovn_northbound import impl_idl as nb_impl_idl
 
 from ovn_bgp_agent import constants
 from ovn_bgp_agent import exceptions
@@ -91,6 +94,46 @@ class OvnSbIdl(OvnIdl):
             self.notify_handler.watch_events(self._events)
         return ovsdbSbConn
 
+
+class OvnNbIdl(OvnIdl):
+    SCHEMA = 'OVN_Northbound'
+
+    def __init__(self, connection_string, events=None, tables=None):
+        if connection_string.startswith("ssl"):
+            self._check_and_set_ssl_files(self.SCHEMA)
+        helper = self._get_ovsdb_helper(connection_string)
+        self._events = events
+        if tables is None:
+            tables = ('Logical_Router_Static_Route', 'Logical_Router')
+        for table in tables:
+            helper.register_table(table)
+        super(OvnNbIdl, self).__init__(
+            None, connection_string, helper)
+
+    def _get_ovsdb_helper(self, connection_string):
+        return idlutils.get_schema_helper(connection_string, self.SCHEMA)
+
+    def _check_and_set_ssl_files(self, schema_name):
+        priv_key_file = CONF.ovn_nb_private_key
+        cert_file = CONF.ovn_nb_certificate
+        ca_cert_file = CONF.ovn_nb_ca_cert
+
+        if priv_key_file:
+            Stream.ssl_set_private_key_file(priv_key_file)
+
+        if cert_file:
+            Stream.ssl_set_certificate_file(cert_file)
+
+        if ca_cert_file:
+            Stream.ssl_set_ca_cert_file(ca_cert_file)
+
+    def start(self):
+        conn = connection.Connection(
+            self, timeout=180)
+        ovsdbNbConn = OvsdbNbOvnIdl(conn)
+        if self._events:
+            self.notify_handler.watch_events(self._events)
+        return ovsdbNbConn
 
 class Backend(ovs_idl.Backend):
     lookup_table = {}
@@ -327,3 +370,89 @@ class OvsdbSbOvnIdl(sb_impl_idl.OvnSbApiIdlImpl, Backend):
                 if len(ovn_lb.datapaths) > 1 and datapath in ovn_lb.datapaths:
                     lbs.append(ovn_lb)
         return lbs
+
+class OvsdbNbOvnIdl(nb_impl_idl.OvnNbApiIdlImpl, Backend):
+    def __init__(self, connection):
+        super(OvsdbNbOvnIdl, self).__init__(connection)
+        self.idl._session.reconnect.set_probe_interval(60000)
+
+    def add_static_route(self, lrouter, **columns):
+        return AddStaticRouteCommand(self, lrouter, **columns)
+
+    def delete_static_route(self, lrouter, ip_prefix, nexthop, if_exists=True):
+        return DelStaticRouteCommand(self, lrouter, ip_prefix, nexthop,
+                                         if_exists)
+
+    @contextlib.contextmanager
+    def transaction(self, *args, **kwargs):
+        """A wrapper on the ovsdbapp transaction to work with revisions.
+
+        This method is just a wrapper around the ovsdbapp transaction
+        to handle revision conflicts correctly.
+        """
+        revision_mismatch_raise = kwargs.pop('revision_mismatch_raise', False)
+        try:
+            with super(OvsdbNbOvnIdl, self).transaction(*args, **kwargs) as t:
+                yield t
+        except:
+            LOG.info('Transaction aborted')
+            raise
+
+class AddStaticRouteCommand(command.BaseCommand):
+    def __init__(self, api, lrouter, **columns):
+        super(AddStaticRouteCommand, self).__init__(api)
+        self.lrouter = lrouter
+        self.columns = columns
+
+    def run_idl(self, txn):
+        try:
+            lrouter = idlutils.row_by_value(self.api.idl, 'Logical_Router',
+                                            'name', self.lrouter)
+        except idlutils.RowNotFound:
+            msg = _("Logical Router %s does not exist") % self.lrouter
+            raise RuntimeError(msg)
+
+        static_routes = getattr(lrouter, 'static_routes', [])
+        self.ip_prefix = self.columns.get('ip_prefix')
+        self.nexthop = self.columns.get('nexthop')
+
+        new_route = (self.ip_prefix, self.nexthop)
+        existing_routes = [(route.ip_prefix, route.nexthop) for route in static_routes]
+
+        if new_route in existing_routes:
+            LOG.info(f"Route {new_route} exists, skipping")
+            return
+
+        if len(existing_routes) == len(static_routes):
+            row = txn.insert(self.api._tables['Logical_Router_Static_Route'])
+            for col, val in self.columns.items():
+                setattr(row, col, val)
+            lrouter.addvalue('static_routes', row.uuid)
+
+class DelStaticRouteCommand(command.BaseCommand):
+    def __init__(self, api, lrouter, ip_prefix, nexthop, if_exists):
+        super(DelStaticRouteCommand, self).__init__(api)
+        self.lrouter = lrouter
+        self.ip_prefix = ip_prefix
+        self.nexthop = nexthop
+        self.if_exists = if_exists
+
+    def run_idl(self, txn):
+        try:
+            lrouter = idlutils.row_by_value(self.api.idl, 'Logical_Router',
+                                            'name', self.lrouter)
+        except idlutils.RowNotFound:
+            if self.if_exists:
+                return
+            msg = _("Logical Router %s does not exist") % self.lrouter
+            raise RuntimeError(msg)
+
+        static_routes = getattr(lrouter, 'static_routes', [])
+        for route in static_routes:
+            ip_prefix = getattr(route, 'ip_prefix', '')
+            nexthop = getattr(route, 'nexthop', '')
+            if self.ip_prefix == ip_prefix and self.nexthop == nexthop:
+                lrouter.delvalue('static_routes', route)
+                route.delete()
+                break
+

@@ -39,8 +39,8 @@ LOG = logging.getLogger(__name__)
 # LOG.setLevel(logging.DEBUG)
 # logging.basicConfig(level=logging.DEBUG)
 
-OVN_TABLES = ["Port_Binding", "Chassis", "Datapath_Binding", "Load_Balancer"]
-
+OVN_SB_TABLES = ["Port_Binding", "Chassis", "Datapath_Binding", "Load_Balancer"]
+OVN_NB_TABLES = ["Logical_Router_Static_Route", "Logical_Router"]
 
 class OVNBGPDriver(driver_api.AgentDriverBase):
 
@@ -57,7 +57,6 @@ class OVNBGPDriver(driver_api.AgentDriverBase):
         self.ovn_lb_vips = collections.defaultdict()
 
         self._sb_idl = None
-        self.fdp = None
         self._post_fork_event = threading.Event()
 
     @property
@@ -75,6 +74,8 @@ class OVNBGPDriver(driver_api.AgentDriverBase):
         self.ovs_idl.start(CONF.ovsdb_connection)
         self.chassis = self.ovs_idl.get_own_chassis_name()
         self.ovn_remote = self.ovs_idl.get_ovn_remote()
+        self.nb_db_sock = "unix:/usr/local/var/run/ovn/ovnnb_db.sock"
+
         LOG.info("Loaded chassis %s.", self.chassis)
 
         LOG.info("Starting VRF configuration for advertising routes")
@@ -109,29 +110,33 @@ class OVNBGPDriver(driver_api.AgentDriverBase):
                 self.sb_idl = ovn.OvnSbIdl(
                     self.ovn_remote,
                     chassis=self.chassis,
-                    tables=OVN_TABLES + ["Chassis_Private",
+                    tables=OVN_SB_TABLES + ["Chassis_Private",
                                          "Logical_DP_Group"],
                     events=events).start()
             except AssertionError:
                 self.sb_idl = ovn.OvnSbIdl(
                     self.ovn_remote,
                     chassis=self.chassis,
-                    tables=OVN_TABLES + ["Chassis_Private"],
+                    tables=OVN_SB_TABLES + ["Chassis_Private"],
                     events=events).start()
         except AssertionError:
             self.sb_idl = ovn.OvnSbIdl(
                 self.ovn_remote,
                 chassis=self.chassis,
-                tables=OVN_TABLES,
+                tables=OVN_SB_TABLES,
                 events=events).start()
+
+        self.nb_idl = ovn.OvnNbIdl(
+                self.nb_db_sock,
+                tables=OVN_NB_TABLES,
+                events=None).start()
 
         # Now IDL connections can be safely used
         self._post_fork_event.set()
 
-        # Enable Fast Data Path:
-        # Wait on FPM socket to get route updates from Zebra
-        # and add them to OVN NB DB
-        self.fdp = enable_fdp.FpmServerConnect(FPM_PORT=2620)
+        LOG.info("Start thread to read routes from Zebra and add them to OVN NB DB")
+        self.fdp = threading.Thread(target=enable_fdp.run, args=(self.nb_idl,))
+        self.fdp.start()
 
     def _get_events(self):
         events = set(["PortBindingChassisCreatedEvent",
@@ -165,11 +170,7 @@ class OVNBGPDriver(driver_api.AgentDriverBase):
         linux_net.ensure_ovn_device(CONF.bgp_nic,
                                     CONF.bgp_vrf)
 
-        #Run asyncore loop to get routes from Zebra and add them to OVN NB DB
-        # TODO(spk): Keep a config to separate between fdp and kernel routing
-        self.fdp.run()
-
-        LOG.debug("Configuring br-ex default rule and routing tables for "
+        LOG.info("Configuring br-ex default rule and routing tables for "
                   "each provider network")
         flows_info = {}
         # 1) Get bridge mappings: xxxx:br-ex,yyyy:br-ex2

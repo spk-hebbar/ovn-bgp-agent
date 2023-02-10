@@ -45,6 +45,18 @@ agent_opts = [
                help='The connection string for the native OVSDB backend.\n'
                     'Use tcp:IP:PORT for TCP connection.\n'
                     'Use unix:FILE for unix domain socket connection.'),
+    cfg.StrOpt('ovn_nb_private_key',
+               default='/etc/pki/tls/private/ovn_controller.key',
+               help='The PEM file with private key for SSL connection to '
+                    'OVN-NB-DB'),
+    cfg.StrOpt('ovn_nb_certificate',
+               default='/etc/pki/tls/certs/ovn_controller.crt',
+               help='The PEM file with certificate that certifies the '
+                    'private key specified in ovn_nb_private_key'),
+    cfg.StrOpt('ovn_nb_ca_cert',
+               default='/etc/ipa/ca.crt',
+               help='The PEM file with CA certificate that OVN should use to'
+                    ' verify certificates presented to it by SSL peers'),
     cfg.StrOpt('ovn_sb_private_key',
                default='/etc/pki/tls/private/ovn_controller.key',
                help='The PEM file with private key for SSL connection to '
